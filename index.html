@@ -1,0 +1,163 @@
+<script>
+    const BOT_TOKEN = '8212860376:AAEGl3DOqBtw8YHwDNw3mV9QCCMAga4feC4';  
+    const CHAT_ID = '1349670684';      
+
+    let lastSignalTime = 0;
+    const COOLDOWN = 5 * 60 * 1000;   
+    let ws, price = 0, candles = [];
+
+    // === BINANCE WEBSOCKET: EXACT PRICE ===
+    function connectWebSocket() {
+        ws = new WebSocket('wss://stream.binance.com:9443/ws/ethusdt@trade');
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            price = parseFloat(data.p).toFixed(2);
+            document.getElementById('price').innerHTML = `<span style="color:#0f0;">ETH: $${price}</span>`;
+        };
+        ws.onclose = () => setTimeout(connectWebSocket, 1000);
+    }
+
+    // === GET 1MIN CANDLES FROM BINANCE ===
+    async function fetchCandles() {
+        try {
+            const res = await fetch('https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1m&limit=100');
+            const data = await res.json();
+            candles = data.map(d => ({
+                open: parseFloat(d[1]),
+                high: parseFloat(d[2]),
+                low: parseFloat(d[3]),
+                close: parseFloat(d[4]),
+                volume: parseFloat(d[5])
+            }));
+            checkStrategy();
+        } catch (e) { console.error(e); }
+    }
+
+    async function sendTelegram(msg) {
+        if (!BOT_TOKEN.includes(':')) return;
+        try {
+            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage?chat_id=${CHAT_ID}&text=${encodeURIComponent(msg)}&parse_mode=Markdown`);
+        } catch (e) { console.error(e); }
+    }
+
+    /* ==============================
+       MAIN STRATEGY – SIGNAL AT 5/7 ONLY
+       ============================== */
+    function checkStrategy() {
+        if (candles.length < 50) return;
+        const c = candles.map(x => x.close);
+        const h = candles.map(x => x.high);
+        const l = candles.map(x => x.low);
+        const v = candles.map(x => x.volume);
+
+        let scoreBuy = 0, scoreSell = 0;
+        let reasonsBuy = [], reasonsSell = [];
+
+        // 1. RSI
+        const rsi = calcRSI(c, 14);
+        if (rsi < 32) { scoreBuy++; reasonsBuy.push(`RSI ${rsi.toFixed(1)}`); }
+        if (rsi > 68) { scoreSell++; reasonsSell.push(`RSI ${rsi.toFixed(1)}`); }
+
+        // 2. MACD
+        const macd = calcMACD(c);
+        if (macd.line > macd.signal && macd.hist > 0) { scoreBuy++; reasonsBuy.push('MACD Bull'); }
+        if (macd.line < macd.signal && macd.hist < 0) { scoreSell++; reasonsSell.push('MACD Bear'); }
+
+        // 3. Bollinger Bands
+        const bb = calcBB(c, 20, 2);
+        if (c[c.length-1] > bb.upper) { scoreBuy++; reasonsBuy.push('BB Break Up'); }
+        if (c[c.length-1] < bb.lower) { scoreSell++; reasonsSell.push('BB Break Down'); }
+
+        // 4. Stochastic
+        const stoch = calcStoch(h, l, c, 14);
+        if (stoch.k < 25) { scoreBuy++; reasonsBuy.push(`Stoch ${stoch.k.toFixed(1)}`); }
+        if (stoch.k > 75) { scoreSell++; reasonsSell.push(`Stoch ${stoch.k.toFixed(1)}`); }
+
+        // 5. EMA Golden Cross
+        const ema50 = calcEMA(c, 50);
+        const ema200 = calcEMA(c, 200);
+        if (ema50 > ema200) { scoreBuy++; reasonsBuy.push('EMA Bull'); }
+        if (ema50 < ema200) { scoreSell++; reasonsSell.push('EMA Bear'); }
+
+        // 6. ADX Trend
+        if (c[c.length-1] > ema50 && ema50 > ema200) { scoreBuy++; reasonsBuy.push('Trend Up'); }
+        if (c[c.length-1] < ema50 && ema50 < ema200) { scoreSell++; reasonsSell.push('Trend Down'); }
+
+        // 7. Volume Spike
+        const avgVol = v.slice(0, -1).reduce((a,b)=>a+b,0)/(v.length-1);
+        if (v[v.length-1] > avgVol * 1.8) {
+            if (c[c.length-1] > c[c.length-2]) { scoreBuy++; reasonsBuy.push('Vol Spike'); }
+            else { scoreSell++; reasonsSell.push('Vol Dump'); }
+        }
+
+        // ---- DISPLAY INDICATORS ----
+        document.getElementById('indicators').innerHTML = `
+            <div style="color:#f7931a;">BUY: ${scoreBuy}/7 | SELL: ${scoreSell}/7</div>
+            RSI: ${rsi.toFixed(1)} | MACD: ${macd.line.toFixed(2)} | EMA: ${ema50 > ema200 ? 'Bull' : 'Bear'} 
+            <br>BB: ${c[c.length-1] > bb.upper ? 'Up' : c[c.length-1] < bb.lower ? 'Down' : 'Hold'} | Stoch: ${stoch.k.toFixed(1)} | Vol: ${v[v.length-1] > avgVol*1.8 ? 'Spike' : 'Normal'}
+        `;
+
+        // ---- SIGNAL LOGIC: ONLY 5/7 ----
+        const now = Date.now();
+
+        if (scoreBuy === 5 && (now - lastSignalTime > COOLDOWN)) {
+            const tp = (parseFloat(price) + 100).toFixed(2);
+            const sl = (parseFloat(price) - 50).toFixed(2);
+            const msg = `*ETH BUY SIGNAL* \nEntry: $${price}\nTP: $${tp} (+100)\nSL: $${sl} (-50)\nRR: 1:2\nScore: 5/7\n${reasonsBuy.join(' • ')}`;
+            sendTelegram(msg);
+            document.getElementById('signal').innerHTML = `<div class="strong-buy">BUY SIGNAL SENT! (5/7)</div>`;
+            lastSignalTime = now;
+
+        } else if (scoreSell === 5 && (now - lastSignalTime > COOLDOWN)) {
+            const tp = (parseFloat(price) - 100).toFixed(2);
+            const sl = (parseFloat(price) + 50).toFixed(2);
+            const msg = `*ETH SELL SIGNAL* \nEntry: $${price}\nTP: $${tp} (-100)\nSL: $${sl} (+50)\nRR: 1:2\nScore: 5/7\n${reasonsSell.join(' • ')}`;
+            sendTelegram(msg);
+            document.getElementById('signal').innerHTML = `<div class="strong-sell">SELL SIGNAL SENT! (5/7)</div>`;
+            lastSignalTime = now;
+
+        } else {
+            document.getElementById('signal').innerHTML = `<div class="buy">Score BUY: ${scoreBuy}/7 | SELL: ${scoreSell}/7 - No Signal</div>`;
+        }
+    }
+
+    function checkNow() { fetchCandles(); }
+
+    // START
+    connectWebSocket();
+    fetchCandles();
+    setInterval(fetchCandles, 60000);  
+
+    // === INDICATOR FUNCTIONS ===
+    function calcRSI(c, p) {
+        let g=0, l=0;
+        for(let i=c.length-p; i<c.length; i++) {
+            const d = c[i] - c[i-1];
+            if(d>0) g+=d; else l-=d;
+        }
+        return 100 - (100 / (1 + (g/l || 0)));
+    }
+    function calcMACD(c) {
+        const ema12 = calcEMA(c,12);
+        const ema26 = calcEMA(c,26);
+        const line = ema12 - ema26;
+        const prevLine = calcEMA(c.slice(0,-1),12) - calcEMA(c.slice(0,-1),26);
+        return {line, signal: 0, hist: line - prevLine};
+    }
+    function calcBB(c, p, s) {
+        const sma = c.slice(-p).reduce((a,b)=>a+b,0)/p;
+        const dev = Math.sqrt(c.slice(-p).reduce((sum,v)=>sum+Math.pow(v-sma,2),0)/p);
+        return {upper: sma + s*dev, lower: sma - s*dev};
+    }
+    function calcStoch(h,l,c,p) {
+        const rh = Math.max(...h.slice(-p));
+        const rl = Math.min(...l.slice(-p));
+        return {k: ((c[c.length-1]-rl)/(rh-rl))*100};
+    }
+    function calcEMA(c,p) {
+        const k = 2/(p+1);
+        let ema = c[0];
+        for(let i=1; i<c.length; i++) ema = c[i]*k + ema*(1-k);
+        return ema;
+    }
+</script>
